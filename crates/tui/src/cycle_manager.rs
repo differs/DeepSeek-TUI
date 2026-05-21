@@ -283,8 +283,11 @@ impl StructuredState {
             for item in &todos.items {
                 let marker = match item.status {
                     crate::tools::todo::TodoStatus::Pending => "[ ]",
+                    crate::tools::todo::TodoStatus::Ready => "[→]",
                     crate::tools::todo::TodoStatus::InProgress => "[~]",
                     crate::tools::todo::TodoStatus::Completed => "[x]",
+                    crate::tools::todo::TodoStatus::Failed => "[!!]",
+                    crate::tools::todo::TodoStatus::Skipped => "[-]",
                 };
                 out.push_str(&format!("- {marker} {}\n", item.content));
             }
@@ -992,6 +995,14 @@ mod tests {
                     id: 1,
                     content: "Run focused tests".to_string(),
                     status: crate::tools::todo::TodoStatus::InProgress,
+                    depends_on: Vec::new(),
+                    created_at: None,
+                    started_at: None,
+                    completed_at: None,
+                    heartbeat: None,
+                    result: None,
+                    error: None,
+                    restart_count: 0,
                 }],
                 completion_pct: 0,
                 in_progress_id: Some(1),

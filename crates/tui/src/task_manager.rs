@@ -27,6 +27,7 @@ use crate::runtime_threads::{
     CreateThreadRequest, RuntimeThreadManager, RuntimeThreadManagerConfig, RuntimeTurnStatus,
     SharedRuntimeThreadManager, StartTurnRequest,
 };
+use crate::tools::todo::{SharedTodoList, TodoStatus};
 use crate::utils::spawn_supervised;
 
 const DEFAULT_WORKERS: usize = 2;
@@ -311,6 +312,8 @@ pub struct TaskManagerConfig {
     pub trust_mode: bool,
     #[allow(dead_code)]
     pub max_subagents: usize,
+    /// Shared todo list for DAG scheduling.
+    pub todo_list: Option<SharedTodoList>,
 }
 
 impl TaskManagerConfig {
@@ -335,7 +338,15 @@ impl TaskManagerConfig {
             allow_shell: config.allow_shell(),
             trust_mode: false,
             max_subagents: config.max_subagents().clamp(1, MAX_SUBAGENTS),
+            todo_list: None,
         }
+    }
+
+    /// Attach a shared todo list for DAG-aware task scheduling.
+    #[must_use]
+    pub fn with_todo_list(mut self, todo_list: SharedTodoList) -> Self {
+        self.todo_list = Some(todo_list);
+        self
     }
 }
 
@@ -709,6 +720,8 @@ pub struct TaskManager {
     state: Mutex<ManagerState>,
     notify: Notify,
     cancel_token: CancellationToken,
+    /// Shared todo list for DAG-aware scheduling.
+    todo_list: Option<SharedTodoList>,
 }
 
 struct ManagerState {
@@ -768,6 +781,7 @@ impl TaskManager {
 
         let cancel_token = CancellationToken::new();
         let default_workspace = cfg.default_workspace.clone();
+        let todo_list = cfg.todo_list.clone();
         let manager = Arc::new(Self {
             cfg,
             default_workspace: Mutex::new(default_workspace),
@@ -782,6 +796,7 @@ impl TaskManager {
             }),
             notify: Notify::new(),
             cancel_token: cancel_token.clone(),
+            todo_list,
         });
 
         {
@@ -1096,6 +1111,10 @@ impl TaskManager {
             .execute(request.clone(), event_tx, cancel.clone());
         tokio::pin!(exec_fut);
 
+        // Health check ticker: fires every 60s to inspect DAG item liveness.
+        let mut health_interval = tokio::time::interval(Duration::from_secs(60));
+        health_interval.tick().await; // skip the immediate first tick
+
         let result = loop {
             tokio::select! {
                 maybe_event = event_rx.recv() => {
@@ -1104,6 +1123,9 @@ impl TaskManager {
                     {
                         tracing::error!("Failed to apply task event for {task_id}: {err}");
                     }
+                }
+                _ = health_interval.tick() => {
+                    self.check_dag_item_health().await;
                 }
                 exec_result = &mut exec_fut => {
                     break exec_result;
@@ -1117,11 +1139,117 @@ impl TaskManager {
             }
         }
 
+        // Check DAG for Ready items and re-enqueue if any remain.
+        // Note: true multi-item parallel execution (JoinSet over Ready items)
+        // is deferred to P2. Current implementation uses round-robin sequential
+        // dispatch: each Ready item triggers a new executor turn.
+        if self.maybe_enqueue_ready_dag_items(&task_id).await {
+            // Push the task back into the queue for the next DAG-aware turn.
+            // Do NOT call finish_task — we want the task to keep running.
+            let mut state = self.state.lock().await;
+            if let Some(task) = state.tasks.get_mut(&task_id) {
+                if task.status == TaskStatus::Running {
+                    task.status = TaskStatus::Queued;
+                    state.queue.push_back(task_id.clone());
+                }
+            }
+            let _ = self.persist_queue_locked(&state.queue);
+            let _ = self.persist_all_locked(&state);
+            drop(state);
+            self.notify.notify_one();
+            return;
+        }
+
         if let Err(err) = self
             .finish_task(&task_id, result, cancel, &request.mode_label)
             .await
         {
             tracing::error!("Failed to finalize task {task_id}: {err}");
+        }
+    }
+
+    /// After a task turn finishes, check if any DAG items are now Ready
+    /// using the shared `TodoList`. If so, re-enqueue the task for another
+    /// turn so the executor can pick up the next sub-task.
+    async fn maybe_enqueue_ready_dag_items(&self, task_id: &str) -> bool {
+        let Some(ref todo_list) = self.todo_list else {
+            return false;
+        };
+        let has_ready = {
+            let list = todo_list.lock().await;
+            !list.get_ready_items().is_empty()
+        };
+        if has_ready {
+            tracing::info!(
+                task_id,
+                "DAG has Ready items, re-enqueuing for next turn"
+            );
+        }
+        has_ready
+    }
+
+    /// Health check: scan all InProgress DAG items and log warnings or
+    /// escalate for items that haven't sent a heartbeat within the threshold.
+    ///
+    /// Thresholds (hard-coded for now; config.toml integration deferred):
+    /// - STALL_THRESHOLD: 5 minutes
+    /// - MAX_RESTARTS: 3
+    async fn check_dag_item_health(&self) {
+        const STALL_THRESHOLD: Duration = Duration::from_secs(300);
+        const MAX_RESTARTS: u32 = 3;
+
+        let Some(ref todo_list) = self.todo_list else {
+            return;
+        };
+
+        let now = Utc::now();
+        let mut list = todo_list.lock().await;
+        let running: Vec<_> = list
+            .get_running_items()
+            .iter()
+            .map(|i| (i.id, i.heartbeat, i.restart_count))
+            .collect();
+
+        for (item_id, heartbeat, restart_count) in running {
+            let since_heartbeat = match heartbeat {
+                Some(hb) => (now - hb).to_std().unwrap_or(Duration::from_secs(0)),
+                None => STALL_THRESHOLD, // no heartbeat at all → treat as stale
+            };
+
+            if since_heartbeat < STALL_THRESHOLD {
+                continue;
+            }
+
+            if since_heartbeat > STALL_THRESHOLD * 2 {
+                if restart_count >= MAX_RESTARTS {
+                    tracing::warn!(
+                        item_id,
+                        restart_count,
+                        "DAG item stalled after {MAX_RESTARTS} restarts, marking as failed"
+                    );
+                    list.update_dag_status(
+                        item_id,
+                        TodoStatus::Failed,
+                        None,
+                        Some(format!(
+                            "Health check: no heartbeat after {restart_count} restarts"
+                        )),
+                    );
+                } else {
+                    list.increment_restart(item_id);
+                    tracing::warn!(
+                        item_id,
+                        restart_count = restart_count + 1,
+                        "DAG item stalled, incrementing restart"
+                    );
+                }
+            } else {
+                tracing::info!(
+                    item_id,
+                    "DAG item heartbeat stale ({:.0?} since last heartbeat)",
+                    since_heartbeat
+                );
+            }
         }
     }
 
@@ -1746,6 +1874,7 @@ mod tests {
             allow_shell: false,
             trust_mode: false,
             max_subagents: 2,
+            todo_list: None,
         }
     }
 

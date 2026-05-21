@@ -1985,6 +1985,7 @@ mod tests {
                 allow_shell: false,
                 trust_mode: false,
                 max_subagents: 2,
+                todo_list: None,
             },
             Arc::new(MockExecutor),
         )

@@ -46,6 +46,10 @@ pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
                 | "exec_shell_interact"
                 | "exec_wait"
                 | "exec_interact"
+                // DAG sub-task tools are always loaded in Agent/Yolo
+                | "task_dynamic_add"
+                | "task_dag_status"
+                | "task_heartbeat"
         );
     if always_loaded_in_action_modes {
         return false;

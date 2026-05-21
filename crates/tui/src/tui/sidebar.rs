@@ -409,8 +409,11 @@ fn push_work_checklist_lines(
     for item in summary.checklist_items[start..end].iter() {
         let (prefix, color) = match item.status {
             TodoStatus::Pending => ("[ ]", palette::TEXT_MUTED),
+            TodoStatus::Ready => ("[→]", palette::STATUS_INFO),
             TodoStatus::InProgress => ("[~]", palette::STATUS_WARNING),
             TodoStatus::Completed => ("[x]", palette::STATUS_SUCCESS),
+            TodoStatus::Failed => ("[!!]", palette::STATUS_ERROR),
+            TodoStatus::Skipped => ("[-]", palette::TEXT_MUTED),
         };
         let text = format!("{prefix} #{} {}", item.id, item.content);
         lines.push(Line::from(Span::styled(

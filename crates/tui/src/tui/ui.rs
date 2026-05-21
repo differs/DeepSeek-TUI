@@ -438,7 +438,8 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
             app.workspace.clone(),
             Some(app.model.clone()),
             Some(app.max_subagents.clamp(1, 4)),
-        ),
+        )
+        .with_todo_list(app.todos.clone()),
         config.clone(),
     )
     .await?;

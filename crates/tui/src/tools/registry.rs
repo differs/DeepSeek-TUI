@@ -823,7 +823,10 @@ impl ToolRegistryBuilder {
     /// Include the todo tool with a shared `TodoList`.
     #[must_use]
     pub fn with_todo_tool(self, todo_list: super::todo::SharedTodoList) -> Self {
-        use super::todo::{TodoAddTool, TodoListTool, TodoUpdateTool, TodoWriteTool};
+        use super::todo::{
+            DagStatusTool, DynamicSubtaskTool, HeartbeatTool, TodoAddTool, TodoListTool,
+            TodoUpdateTool, TodoWriteTool,
+        };
         self.with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
             .with_tool(Arc::new(TodoAddTool::checklist(todo_list.clone())))
             .with_tool(Arc::new(TodoUpdateTool::checklist(todo_list.clone())))
@@ -831,7 +834,11 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(TodoWriteTool::new(todo_list.clone())))
             .with_tool(Arc::new(TodoAddTool::new(todo_list.clone())))
             .with_tool(Arc::new(TodoUpdateTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoListTool::new(todo_list)))
+            .with_tool(Arc::new(TodoListTool::new(todo_list.clone())))
+            // DAG tools (worker-only in phase 3, globally registered for now)
+            .with_tool(Arc::new(DynamicSubtaskTool::new(todo_list.clone())))
+            .with_tool(Arc::new(DagStatusTool::new(todo_list.clone())))
+            .with_tool(Arc::new(HeartbeatTool::new(todo_list)))
     }
 
     /// Include the plan tool with a shared `PlanState`.
